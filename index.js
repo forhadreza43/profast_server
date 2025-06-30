@@ -1,4 +1,6 @@
 require("dotenv").config();
+const jwt = require("jsonwebtoken");
+const cookieParser = require("cookie-parser");
 const stripe = require("stripe")(process.env.STRIPE_PRIVATE_KEY);
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const express = require("express");
@@ -6,8 +8,51 @@ const cors = require("cors");
 const port = process.env.PORT || 3000;
 const app = express();
 
-app.use(cors());
+app.use(
+  cors({
+    origin: "http://localhost:5173",
+    credentials: true,
+  })
+);
+app.use(cookieParser());
 app.use(express.json());
+
+const generateTokens = (user) => {
+  const accessToken = jwt.sign(
+    { userId: user._id, role: user.role },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: "15m" }
+  );
+
+  const refreshToken = jwt.sign(
+    { userId: user._id },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  return { accessToken, refreshToken };
+};
+
+const verifyJWT = (req, res, next) => {
+  const token = req.cookies?.token;
+
+  if (!token) {
+    return res
+      .status(401)
+      .send({ success: false, message: "Unauthorized: No token" });
+  }
+
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      return res
+        .status(403)
+        .send({ success: false, message: "Forbidden: Invalid token" });
+    }
+
+    req.user = decoded; // e.g., { userId, role }
+    next();
+  });
+};
 
 const uri = `mongodb+srv://${process.env.MONGO_USER}:${process.env.MONGO_PASS}@crudcluster.buy7rkc.mongodb.net/?retryWrites=true&w=majority&appName=crudCluster`;
 
@@ -24,12 +69,132 @@ async function run() {
     const parcelDB = client.db("parcelDB");
     const parcelCollection = parcelDB.collection("parcels");
     const paymentCollection = parcelDB.collection("payments");
+    const usersCollection = parcelDB.collection("users");
+    const ridersCollection = parcelDB.collection("riders");
+
     app.get("/", (_req, res) => {
       res.send("ProFast Server Running.");
     });
 
+    app.post("/logout", (req, res) => {
+      res
+        .clearCookie("token", {
+          httpOnly: true,
+        })
+        .clearCookie("refresh_token")
+        .send({ success: true, message: "Logged out successfully" });
+    });
+
+    app.post("/refresh-token", (req, res) => {
+      const refreshToken = req.cookies.refresh_token;
+
+      if (!refreshToken) {
+        return res.status(401).send({ message: "Unauthorized" });
+      }
+
+      try {
+        const decoded = jwt.verify(
+          refreshToken,
+          process.env.REFRESH_TOKEN_SECRET
+        );
+        const newAccessToken = jwt.sign(
+          { userId: decoded.userId },
+          process.env.ACCESS_TOKEN_SECRET,
+          { expiresIn: "15m" }
+        );
+
+        res.cookie("token", newAccessToken, {
+          httpOnly: true,
+          maxAge: 15 * 60 * 1000,
+        });
+
+        res.send({ success: true });
+      } catch (err) {
+        return res.status(403).send({ message: "Invalid refresh token" });
+      }
+    });
+
+    app.post("/users/upsert", async (req, res) => {
+      const { email, name, photo, role } = req.body;
+
+      if (!email || !name) {
+        return res
+          .status(400)
+          .send({ success: false, message: "Missing required fields" });
+      }
+
+      const now = new Date().toISOString();
+      const userData = {
+        name,
+        email,
+        photo: photo || "https://example.com/default-avatar.jpg",
+        role,
+        last_login: now,
+      };
+
+      try {
+        const result = await usersCollection.updateOne(
+          { email },
+          {
+            $setOnInsert: {
+              created_at: now,
+              role,
+            },
+            $set: {
+              name: userData.name,
+              photo: userData.photo,
+              last_login: userData.last_login,
+            },
+          },
+          { upsert: true }
+        );
+        const userRecord = await usersCollection.findOne({ email });
+        const { accessToken, refreshToken } = generateTokens(userRecord);
+        if (result.upsertedCount > 0) {
+          res
+            .cookie("token", accessToken, {
+              httpOnly: true,
+              maxAge: 7 * 24 * 60 * 60 * 1000,
+            })
+            .cookie("refresh_token", refreshToken, {
+              httpOnly: true,
+              maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+              secure: true,
+            })
+            .status(201)
+            .send({
+              success: true,
+              message: "User created",
+              inserted: true,
+            });
+        } else {
+          res
+            .cookie("token", accessToken, {
+              httpOnly: true,
+              maxAge: 7 * 24 * 60 * 60 * 1000,
+            })
+            .cookie("refresh_token", refreshToken, {
+              httpOnly: true,
+              maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+              secure: true,
+            })
+            .send({
+              success: true,
+              message: "User updated",
+              inserted: false,
+            });
+        }
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: "Database error",
+          error: error.message,
+        });
+      }
+    });
+
     //! Get parcels of current user if user not exist then get all parcel data
-    app.get("/parcels", async (req, res) => {
+    app.get("/parcels", verifyJWT, async (req, res) => {
       const userEmail = req.query.email;
       let query = {};
       if (userEmail) {
@@ -44,6 +209,57 @@ async function run() {
         res.send(parcels);
       } catch (err) {
         res.status(500).send({ error: "Failed to fetch parcels" });
+      }
+    });
+
+    app.post("/riders", async (req, res) => {
+      const rider = req.body;
+      const result = await ridersCollection.insertOne(rider);
+      res.send(result);
+    });
+
+    // GET /riders/pending
+    app.get("/riders/pending", async (req, res) => {
+      try {
+        const pendingRiders = await ridersCollection
+          .find({ status: "pending" })
+          .toArray();
+
+        res.send({ success: true, data: pendingRiders });
+      } catch (error) {
+        res.status(500).send({
+          success: false,
+          message: "Failed to fetch pending riders",
+          error: error.message,
+        });
+      }
+    });
+
+    // GET /riders/active
+    app.get("/riders/active", async (req, res) => {
+      try {
+        const activeRiders = await ridersCollection
+          .find({ status: "approved" })
+          .toArray();
+        res.send({ success: true, data: activeRiders });
+      } catch (error) {
+        res.status(500).send({ success: false, message: "Server error" });
+      }
+    });
+
+    app.patch("/riders/:id", async (req, res) => {
+      const { id } = req.params;
+      const updatedFields = req.body;
+
+      try {
+        const result = await ridersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updatedFields }
+        );
+
+        res.send({ success: true, result });
+      } catch (error) {
+        res.status(500).send({ success: false, error: error.message });
       }
     });
 
